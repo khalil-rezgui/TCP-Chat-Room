@@ -1,125 +1,203 @@
 #include <iostream>
-#include <algorithm>
-#include <string>
-#include <vector>
-#include <thread>
 #include <cstring>
-#include <arpa/inet.h>
-#include <sys/socket.h>
+#include <cerrno>
+#include <pthread.h>
 #include <unistd.h>
-#include <mutex>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <arpa/inet.h>
 
-// Constants
-const int PORT = 8080;
-const int MAX_CLIENTS = 10;
+/* how many pending connections queue will hold */
+#define BACKLOG 10 //irrelevant
+#define MAXDATASIZE 300
+/* my address information, address where I run this program */
+char bCont = 'O';
+#define BACKLOG 10
+#define MAXDATASIZE 300
+#define MAXSESSIONS 10
 
-// Global variables
-std::vector<int> client_sockets; // Vector to store client socket descriptors
-std::mutex mtx; // Mutex for thread safety
+static void *ReceiveDataEar(void *p_data);
+typedef struct {
+    int fd;
+    int pos;
+    char AdresseIP[16];
+    pthread_t thread_start;
+} tSession;
 
-// Function to send a message to a client
-void send_message(int client_socket, const std::string& message) {
-    send(client_socket, message.c_str(), message.size(), 0);
+tSession sessions[MAXSESSIONS];
+int iNbSession;
+
+void initSessions() {
+    for (int i = 0; i < MAXSESSIONS; i++) {
+        sessions[i].fd = 0;
+        sessions[i].pos = -1;
+    }
 }
 
-// Function to receive a message from a client
-std::string receive_message(int client_socket) {
-    char buffer[1024] = {0};
-    recv(client_socket, buffer, 1024, 0);
-    return std::string(buffer);
+int getNextPos() {
+    for (int p = 0; p < MAXSESSIONS; p++) {
+        if (sessions[p].pos == -1) {
+            return p;
+        }
+    }
+    return -1;
 }
 
-// Function to handle a client connection
-void handle_client(int client_socket) {
-    while (true) {
-        // Receive message from client
-        std::string message = receive_message(client_socket);
-        if (message.empty()) {
-            // If message is empty, client disconnected
-            std::lock_guard<std::mutex> lock(mtx);
-            // Remove client socket from the vector
-			auto it = std::find(std::begin(client_sockets), std::end(client_sockets), client_socket);
-            if (it != client_sockets.end()) {
-                client_sockets.erase(it);
+int init_server(int uPort, int *sockfd) {
+    /* my address information, address where I run this program */
+    struct sockaddr_in my_addr;
+    /* remote address information */
+    std::cout << "Server-The local port is: " << uPort << std::endl;
+    *sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (*sockfd == -1) {
+        perror("socket() error !");
+        return -1;
+    } else std::cout << "socket() is OK..." << std::endl;
+    int yes = 1;
+    if (setsockopt(*sockfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) == -1) {
+        perror("Server-setsockopt() error lol!");
+        return -1;
+    } else std::cout << "Server-setsockopt is OK..." << std::endl;
+    my_addr.sin_family = AF_INET; //Stack IPv4
+    /* short, network byte order */
+    my_addr.sin_port = htons(uPort);
+    /* auto-fill with my IP */
+    my_addr.sin_addr.s_addr = INADDR_ANY;
+    memset(&(my_addr.sin_zero), 0, 8);
+    if (bind(*sockfd, (struct sockaddr *) &my_addr, sizeof(struct sockaddr)) == -1) {
+        perror("bind() error lol!");
+        return -1;
+    } else
+        std::cout << "bind() on " << uPort << " port is OK..." << std::endl;
+    if (listen(*sockfd, BACKLOG) == -1) {
+        perror("listen() error lol!");
+        return -1;
+    } else
+        std::cout << "SERVER: listen() is OK..." << std::endl;
+    return 0;
+}
+
+void *ReceiveConnections(void *p_data) {
+    char message[200];
+    int sockfd = *(int *) p_data;
+    int new_fd;
+    struct sockaddr_in their_addr;
+    unsigned int sin_size;
+
+    std::cout << "accept connection on " << sockfd << " socket" << std::endl;
+
+    do {
+        sin_size = sizeof(struct sockaddr_in); // Initialize sin_size
+        new_fd = accept(sockfd, (struct sockaddr *) &their_addr, &sin_size);
+
+        if (new_fd == -1) {
+            perror("SERVER : accept() unlocked !");
+            return NULL;
+        } else {
+            std::cout << "SERVER : accept a new connection from [" << inet_ntoa(their_addr.sin_addr) << "]" << std::endl;
+            sprintf(message, "You are welcome...");
+
+            if (send(new_fd, message, strlen(message), 0) == -1)
+                perror("Server-send() error !");
+
+            int iPos = getNextPos();
+
+            if (iPos >= 0) {
+                sprintf(message, "SETID %d", iPos + 1);
+
+                if (send(new_fd, message, strlen(message), 0) == -1)
+                    perror("Server-send() error !");
+
+                std::cout << "SERVER : welcome message sent...." << std::endl;
+
+                // Mutex section...
+                sessions[iPos].fd = new_fd;
+                sessions[iPos].pos = iPos + 1;
+                strcpy(sessions[iPos].AdresseIP, inet_ntoa(their_addr.sin_addr));
+
+                // Dedicate a thread for client session after welcome message
+                pthread_create(&sessions[iPos].thread_start, NULL, ReceiveDataEar, (void *) &sessions[iPos]);
+                std::cout << "SERVER : dedicated ear thread launched...." << std::endl;
             }
-            close(client_socket); // Close client socket
-            std::cout << "Client disconnected" << std::endl;
+        }
+    } while (bCont);
+
+    return NULL;
+}
+
+static void *ReceiveDataEar(void *p_data) {
+    int new_fd;
+    if (p_data != NULL)/* retrieve application context */
+        new_fd = *(int *) p_data;
+
+    int numbytes;
+    char buf[MAXDATASIZE];
+    do {
+        if ((numbytes = recv(new_fd, buf, MAXDATASIZE - 1, 0)) == -1) {
+            perror("recv()");
+            exit(1);
+        }
+
+        if (numbytes > 0) {
+            buf[numbytes] = '\0'; // Ensure null-termination
+            std::cout << "\n[Client]: " << buf << std::endl;
+
+            if (strcmp(buf, "stop") == 0)
+                bCont = 'N';
+        } else if (numbytes == 0) {
+            bCont = 'n';
+        }
+    } while ((bCont != 'n') && (bCont != 'N'));
+
+    close(new_fd);
+    std::cout << "ReceiveDataEar thread exiting...press a char to exit!" << std::endl;
+
+    return NULL;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc != 2) {
+        std::cerr << "Server-Usage: " << argv[0] << " the_port" << std::endl;
+        exit(1);
+    } // get the host info
+    unsigned int uPort = atoi(argv[1]);
+    initSessions();
+    int sockfd;
+    int ret = init_server(uPort, &sockfd);
+    pthread_t tThreadAccept;
+    if (ret < 0) { //request for closing from main thread
+        perror("SERVER : init Failure !");
+        exit(1);
+    } else { //success case !
+        pthread_create(&tThreadAccept, NULL, ReceiveConnections, (void *) &sockfd);
+        std::cout << "Waiting for thread to accept connection..." << std::endl;
+    }
+    char message[200];
+    do {
+        std::cout << "\n[Me]:";
+        scanf("%s", message);
+        if (strlen(message) == 0)
+            continue;
+        if (bCont == 'N')
             break;
+        std::cout << "Message to send on broadcast[" << MAXSESSIONS << "] :" << message << std::endl;
+        for (int i = 0; i < MAXSESSIONS; i++) {
+            if (sessions[i].fd != 0)
+                if (send(sessions[i].fd, message, strlen(message), 0) == -1)
+                    perror("sending() error !");
         }
-        std::cout << "Received: " << message << std::endl;
-
-        // Broadcast the message to all other clients
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-            for (int socket : client_sockets) {
-                if (socket != client_socket) {
-                    send_message(socket, message);
-                }
-            }
-        }
+        if (strcmp(message, "stop") == 0)
+            bCont = 'N';
+    } while ((bCont != 'n') && (bCont != 'N'));
+    std::cout << "Closing sockets..." << std::endl;
+    close(sockfd);
+    for (int i = 0; i < MAXSESSIONS; i++) {
+        if (sessions[i].fd != 0)
+            pthread_join(sessions[i].thread_start, NULL);
     }
-}
-
-// Main server function
-void server() {
-    int server_socket, client_socket;
-    struct sockaddr_in server_addr, client_addr;
-    int opt = 1;
-    int addrlen = sizeof(server_addr);
-
-    // Create server socket
-    if ((server_socket = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
-        perror("socket failed");
-        exit(EXIT_FAILURE);
-    }
-
-    // Set socket options
-    if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
-        perror("setsockopt");
-        exit(EXIT_FAILURE);
-    }
-
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(PORT);
-
-    // Bind socket to port
-    if (bind(server_socket, (struct sockaddr *)&server_addr, sizeof(server_addr))<0) {
-        perror("bind failed");
-        exit(EXIT_FAILURE);
-    }
-
-    // Listen for connections
-    if (listen(server_socket, MAX_CLIENTS) < 0) {
-        perror("listen");
-        exit(EXIT_FAILURE);
-    }
-
-    std::cout << "Server listening on port " << PORT << std::endl;
-
-    // Accept incoming connections
-    while (true) {
-        if ((client_socket = accept(server_socket, (struct sockaddr *)&client_addr, (socklen_t*)&addrlen))<0) {
-            perror("accept");
-            exit(EXIT_FAILURE);
-        }
-
-        std::cout << "New client connected" << std::endl;
-
-        // Add client socket to the vector
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-            client_sockets.push_back(client_socket);
-        }
-
-        // Handle client in a new thread
-        std::thread client_thread(handle_client, client_socket);
-        client_thread.detach();
-    }
-}
-
-// Main function
-int main() {
-    server(); // Start the server
+    pthread_join(tThreadAccept, NULL);
+    std::cout << "Server exited properly :)" << std::endl;
     return 0;
 }
